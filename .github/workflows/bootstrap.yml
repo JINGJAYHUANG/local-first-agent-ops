@@ -1,4 +1,4 @@
-name: Recover public v0.1.0 source
+name: Diagnose public v0.1.0 transport
 
 on:
   push:
@@ -10,138 +10,65 @@ on:
       - .github/workflows/bootstrap.yml
 
 permissions:
-  contents: write
-
-concurrency:
-  group: local-first-agent-ops-bootstrap
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  materialize:
+  diagnose:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    env:
-      PYTHONPATH: src
-
+    timeout-minutes: 10
     steps:
-      - name: Check out build branch
+      - name: Check out transport branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: feat/public-v0.1.0
-          fetch-depth: 0
-          persist-credentials: true
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Set up Python 3.13
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-          cache: ""
-
-      - name: Verify transport chunks and materialize public source
+      - name: Compare embedded and chunked payloads
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          from __future__ import annotations
-
-          import base64
-          import hashlib
+          import difflib
           import importlib.util
-          import io
-          import tarfile
           from pathlib import Path
 
-          root = Path.cwd()
-          script = root / '.bootstrap/bootstrap.py'
+          script = Path('.bootstrap/bootstrap.py')
           spec = importlib.util.spec_from_file_location('bootstrap_payload', script)
           if spec is None or spec.loader is None:
               raise SystemExit('cannot load bootstrap metadata')
           module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(module)
-
-          chunk_paths = sorted((root / '.bootstrap/chunks').glob('*.b64'))
-          if not chunk_paths:
-              raise SystemExit('no transport chunks found')
-          encoded = ''.join(path.read_text(encoding='ascii') for path in chunk_paths)
-          normalized = ''.join(encoded.split()).rstrip('=')
-          normalized += '=' * (-len(normalized) % 4)
-          archive = base64.b64decode(normalized.encode('ascii'), validate=True)
-          digest = hashlib.sha256(archive).hexdigest()
-          if digest != module.ARCHIVE_SHA256:
-              raise SystemExit(
-                  f'archive hash mismatch: {digest} != {module.ARCHIVE_SHA256}'
-              )
-
-          observed: dict[str, str] = {}
-          with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as bundle:
-              for member in bundle.getmembers():
-                  relative = Path(member.name)
-                  if (
-                      member.name.startswith('/')
-                      or '..' in relative.parts
-                      or not member.isfile()
-                      or member.issym()
-                      or member.islnk()
-                  ):
-                      raise SystemExit(f'unsafe archive member: {member.name}')
-                  expected = module.FILE_HASHES.get(member.name)
-                  if expected is None:
-                      raise SystemExit(f'unexpected archive member: {member.name}')
-                  handle = bundle.extractfile(member)
-                  if handle is None:
-                      raise SystemExit(f'cannot read archive member: {member.name}')
-                  data = handle.read()
-                  actual = hashlib.sha256(data).hexdigest()
-                  if actual != expected:
-                      raise SystemExit(f'file hash mismatch: {member.name}')
-                  target = root / relative
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  target.write_bytes(data)
-                  observed[member.name] = actual
-
-          if observed != module.FILE_HASHES:
-              missing = sorted(set(module.FILE_HASHES) - set(observed))
-              raise SystemExit(f'transport file-set mismatch; missing={missing}')
-          print(
-              f'materialized {len(observed)} files from {len(chunk_paths)} '
-              f'verified chunks; sha256={digest}'
+          embedded = ''.join(module.PAYLOAD.split()).rstrip('=')
+          chunked = ''.join(
+              path.read_text(encoding='ascii')
+              for path in sorted(Path('.bootstrap/chunks').glob('*.b64'))
           )
+          chunked = ''.join(chunked.split()).rstrip('=')
+          prefix = 0
+          for left, right in zip(embedded, chunked):
+              if left != right:
+                  break
+              prefix += 1
+          suffix = 0
+          for left, right in zip(reversed(embedded), reversed(chunked)):
+              if left != right:
+                  break
+              suffix += 1
+          print(f'archive_sha256={module.ARCHIVE_SHA256}')
+          print(f'embedded_length={len(embedded)} mod4={len(embedded) % 4}')
+          print(f'chunked_length={len(chunked)} mod4={len(chunked) % 4}')
+          print(f'common_prefix={prefix} common_suffix={suffix}')
+          matcher = difflib.SequenceMatcher(None, embedded, chunked, autojunk=False)
+          opcodes = matcher.get_opcodes()
+          print(f'opcode_count={len(opcodes)} ratio={matcher.ratio():.12f}')
+          for opcode in opcodes:
+              tag, i1, i2, j1, j2 = opcode
+              if tag != 'equal':
+                  print(
+                      f'{tag} embedded[{i1}:{i2}]={embedded[i1:i2]!r} '
+                      f'chunked[{j1}:{j2}]={chunked[j1:j2]!r}'
+                  )
+          raise SystemExit('diagnostic complete')
           PY
-
-      - name: Run complete release gate
-        run: python scripts/run_release_gate.py
-
-      - name: Package recovered source
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar \
-            --exclude=.git \
-            --exclude=.bootstrap \
-            --exclude=.github/workflows/bootstrap.yml \
-            -czf /tmp/local-first-agent-ops-v0.1-source.tar.gz .
-          sha256sum /tmp/local-first-agent-ops-v0.1-source.tar.gz
-
-      - name: Upload recovered source
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: local-first-agent-ops-v0.1-source
-          path: /tmp/local-first-agent-ops-v0.1-source.tar.gz
-          if-no-files-found: error
-          retention-days: 3
-
-      - name: Commit generated project
-        shell: bash
-        run: |
-          set -euo pipefail
-          git restore .bootstrap/bootstrap.py .github/workflows/bootstrap.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No project changes to commit."
-            exit 0
-          fi
-          git commit -m "feat: materialize local-first agent operations source"
-          git push origin HEAD:feat/public-v0.1.0
