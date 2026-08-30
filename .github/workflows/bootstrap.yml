@@ -6,6 +6,7 @@ on:
       - feat/public-v0.1.0
     paths:
       - .bootstrap/bootstrap.py
+      - .bootstrap/chunks/**
       - .github/workflows/bootstrap.yml
 
 permissions:
@@ -37,28 +38,76 @@ jobs:
           python-version: "3.13"
           cache: ""
 
-      - name: Normalize transport padding
+      - name: Verify transport chunks and materialize public source
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import hashlib
+          import importlib.util
+          import io
+          import tarfile
           from pathlib import Path
 
-          path = Path('.bootstrap/bootstrap.py')
-          text = path.read_text(encoding='utf-8')
-          old = '    archive = base64.b64decode(PAYLOAD.encode("ascii"), validate=True)\n'
-          new = (
-              '    normalized_payload = "".join(PAYLOAD.split()).rstrip("=")\n'
-              '    normalized_payload += "=" * (-len(normalized_payload) % 4)\n'
-              '    archive = base64.b64decode(normalized_payload.encode("ascii"), validate=True)\n'
-          )
-          if text.count(old) != 1:
-              raise SystemExit('expected one bootstrap decode statement')
-          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
-          PY
+          root = Path.cwd()
+          script = root / '.bootstrap/bootstrap.py'
+          spec = importlib.util.spec_from_file_location('bootstrap_payload', script)
+          if spec is None or spec.loader is None:
+              raise SystemExit('cannot load bootstrap metadata')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
 
-      - name: Verify and materialize public source
-        run: python .bootstrap/bootstrap.py
+          chunk_paths = sorted((root / '.bootstrap/chunks').glob('*.b64'))
+          if not chunk_paths:
+              raise SystemExit('no transport chunks found')
+          encoded = ''.join(path.read_text(encoding='ascii') for path in chunk_paths)
+          normalized = ''.join(encoded.split()).rstrip('=')
+          normalized += '=' * (-len(normalized) % 4)
+          archive = base64.b64decode(normalized.encode('ascii'), validate=True)
+          digest = hashlib.sha256(archive).hexdigest()
+          if digest != module.ARCHIVE_SHA256:
+              raise SystemExit(
+                  f'archive hash mismatch: {digest} != {module.ARCHIVE_SHA256}'
+              )
+
+          observed: dict[str, str] = {}
+          with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as bundle:
+              for member in bundle.getmembers():
+                  relative = Path(member.name)
+                  if (
+                      member.name.startswith('/')
+                      or '..' in relative.parts
+                      or not member.isfile()
+                      or member.issym()
+                      or member.islnk()
+                  ):
+                      raise SystemExit(f'unsafe archive member: {member.name}')
+                  expected = module.FILE_HASHES.get(member.name)
+                  if expected is None:
+                      raise SystemExit(f'unexpected archive member: {member.name}')
+                  handle = bundle.extractfile(member)
+                  if handle is None:
+                      raise SystemExit(f'cannot read archive member: {member.name}')
+                  data = handle.read()
+                  actual = hashlib.sha256(data).hexdigest()
+                  if actual != expected:
+                      raise SystemExit(f'file hash mismatch: {member.name}')
+                  target = root / relative
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+                  observed[member.name] = actual
+
+          if observed != module.FILE_HASHES:
+              missing = sorted(set(module.FILE_HASHES) - set(observed))
+              raise SystemExit(f'transport file-set mismatch; missing={missing}')
+          print(
+              f'materialized {len(observed)} files from {len(chunk_paths)} '
+              f'verified chunks; sha256={digest}'
+          )
+          PY
 
       - name: Run complete release gate
         run: python scripts/run_release_gate.py
