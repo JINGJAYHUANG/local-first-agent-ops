@@ -37,6 +37,26 @@ jobs:
           python-version: "3.13"
           cache: ""
 
+      - name: Normalize transport padding
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.bootstrap/bootstrap.py')
+          text = path.read_text(encoding='utf-8')
+          old = '    archive = base64.b64decode(PAYLOAD.encode("ascii"), validate=True)\n'
+          new = (
+              '    normalized_payload = "".join(PAYLOAD.split()).rstrip("=")\n'
+              '    normalized_payload += "=" * (-len(normalized_payload) % 4)\n'
+              '    archive = base64.b64decode(normalized_payload.encode("ascii"), validate=True)\n'
+          )
+          if text.count(old) != 1:
+              raise SystemExit('expected one bootstrap decode statement')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+
       - name: Verify and materialize public source
         run: python .bootstrap/bootstrap.py
 
@@ -47,6 +67,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git restore .bootstrap/bootstrap.py .github/workflows/bootstrap.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
