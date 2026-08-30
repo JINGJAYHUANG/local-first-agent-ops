@@ -1,4 +1,4 @@
-name: Bootstrap public v0.1.0
+name: Recover public v0.1.0 source
 
 on:
   push:
@@ -63,6 +63,25 @@ jobs:
       - name: Run complete release gate
         run: python scripts/run_release_gate.py
 
+      - name: Package recovered source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar \
+            --exclude=.git \
+            --exclude=.bootstrap \
+            --exclude=.github/workflows/bootstrap.yml \
+            -czf /tmp/local-first-agent-ops-v0.1-source.tar.gz .
+          sha256sum /tmp/local-first-agent-ops-v0.1-source.tar.gz
+
+      - name: Upload recovered source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: local-first-agent-ops-v0.1-source
+          path: /tmp/local-first-agent-ops-v0.1-source.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Commit generated project
         shell: bash
         run: |
@@ -75,5 +94,5 @@ jobs:
             echo "No project changes to commit."
             exit 0
           fi
-          git commit -m "feat: publish local-first agent operations reference"
+          git commit -m "feat: materialize local-first agent operations source"
           git push origin HEAD:feat/public-v0.1.0
