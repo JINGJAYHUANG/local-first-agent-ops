@@ -1,0 +1,79 @@
+name: Bootstrap public v0.1.0
+
+on:
+  push:
+    branches:
+      - feat/public-v0.1.0
+    paths:
+      - .bootstrap/bootstrap.py
+      - .github/workflows/bootstrap.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: local-first-agent-ops-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  materialize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: src
+
+    steps:
+      - name: Check out build branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: feat/public-v0.1.0
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: ""
+
+      - name: Normalize transport padding
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.bootstrap/bootstrap.py')
+          text = path.read_text(encoding='utf-8')
+          old = '    archive = base64.b64decode(PAYLOAD.encode("ascii"), validate=True)\n'
+          new = (
+              '    normalized_payload = "".join(PAYLOAD.split()).rstrip("=")\n'
+              '    normalized_payload += "=" * (-len(normalized_payload) % 4)\n'
+              '    archive = base64.b64decode(normalized_payload.encode("ascii"), validate=True)\n'
+          )
+          if text.count(old) != 1:
+              raise SystemExit('expected one bootstrap decode statement')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+
+      - name: Verify and materialize public source
+        run: python .bootstrap/bootstrap.py
+
+      - name: Run complete release gate
+        run: python scripts/run_release_gate.py
+
+      - name: Commit generated project
+        shell: bash
+        run: |
+          set -euo pipefail
+          git restore .bootstrap/bootstrap.py .github/workflows/bootstrap.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No project changes to commit."
+            exit 0
+          fi
+          git commit -m "feat: publish local-first agent operations reference"
+          git push origin HEAD:feat/public-v0.1.0
